@@ -7,7 +7,11 @@ import { describe, expect, it } from "vitest";
 import worker from "../src/index";
 import { buildGlossaryPrompt } from "../src/glossary";
 import { cleanSourceText, extractPaperContext } from "../src/prompt";
-import { createThinkFilter, stripThinking } from "../src/stream";
+import {
+	createThinkFilter,
+	STREAM_INTERRUPTED_NOTICE,
+	stripThinking,
+} from "../src/stream";
 
 const API_KEY = "test-key";
 const GEMMA = "@cf/google/gemma-4-26b-a4b-it";
@@ -83,6 +87,23 @@ function streamOf(pieces: string[]): ReadableStream<Uint8Array> {
 				controller.enqueue(encoder.encode(piece));
 			}
 			controller.close();
+		},
+	});
+}
+
+/**
+ * 先输出给定分片，之后的读取抛出错误，模拟上游在输出途中断开。
+ */
+function failingStreamOf(pieces: string[]): ReadableStream<Uint8Array> {
+	const encoder = new TextEncoder();
+	let index = 0;
+	return new ReadableStream({
+		pull(controller) {
+			if (index < pieces.length) {
+				controller.enqueue(encoder.encode(pieces[index++]));
+			} else {
+				controller.error(new Error("upstream connection lost"));
+			}
 		},
 	});
 }
@@ -435,6 +456,28 @@ describe("Worker", () => {
 		});
 	});
 
+	it("ends the stream with a notice when the model fails mid-stream", async () => {
+		const { env: testEnv } = createEnv(() =>
+			failingStreamOf([
+				'data: {"response":"部分"}\n\n',
+				'data: {"response":"译文"}\n\ndata: {"respo',
+			]),
+		);
+
+		const { response, text } = await send(
+			testEnv,
+			chatRequest(pluginBody("Interrupted", { stream: true })),
+		);
+
+		expect(response.status).toBe(200);
+		expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true);
+		expect(text).toContain('"finish_reason":"error"');
+		expect(parseLikeZotero(text)).toEqual({
+			result: `部分译文${STREAM_INTERRUPTED_NOTICE}`,
+			finished: true,
+		});
+	});
+
 	describe("translation cache", () => {
 		it("serves a repeated translation from cache, also as a stream", async () => {
 			const { env: testEnv, calls } = createEnv(reply("缓存译文"), {
@@ -479,6 +522,57 @@ describe("Worker", () => {
 
 			expect(cached.header("X-Translation-Cache")).toBe("HIT");
 			expect(cached.json().choices[0].message.content).toBe("流式译文");
+			expect(calls).toHaveLength(1);
+		});
+
+		it("does not cache a stream interrupted by an upstream error", async () => {
+			const { env: testEnv, calls } = createEnv(
+				() => failingStreamOf(['data: {"response":"半截"}\n\n']),
+				{ cache: true },
+			);
+			const body = pluginBody("Fails halfway.");
+
+			await send(testEnv, chatRequest({ ...body, stream: true }));
+			const again = await send(testEnv, chatRequest({ ...body, stream: true }));
+
+			expect(again.header("X-Translation-Cache")).toBe("MISS");
+			expect(calls).toHaveLength(2);
+		});
+
+		it("does not cache a stream that closes without [DONE] or a finish reason", async () => {
+			const { env: testEnv, calls } = createEnv(
+				() => streamOf(['data: {"response":"可能不完整"}\n\n']),
+				{ cache: true },
+			);
+			const body = pluginBody("Closed early.");
+
+			const first = await send(testEnv, chatRequest({ ...body, stream: true }));
+			expect(parseLikeZotero(first.text)).toEqual({
+				result: "可能不完整",
+				finished: true,
+			});
+
+			const again = await send(testEnv, chatRequest({ ...body, stream: true }));
+			expect(again.header("X-Translation-Cache")).toBe("MISS");
+			expect(calls).toHaveLength(2);
+		});
+
+		it("caches a stream that reports finish_reason stop without [DONE]", async () => {
+			const { env: testEnv, calls } = createEnv(
+				() =>
+					streamOf([
+						'data: {"choices":[{"delta":{"content":"完整译文"}}]}\n\n',
+						'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+					]),
+				{ cache: true },
+			);
+			const body = pluginBody("Finished without DONE.");
+
+			await send(testEnv, chatRequest({ ...body, stream: true }));
+			const cached = await send(testEnv, chatRequest(body));
+
+			expect(cached.header("X-Translation-Cache")).toBe("HIT");
+			expect(cached.json().choices[0].message.content).toBe("完整译文");
 			expect(calls).toHaveLength(1);
 		});
 

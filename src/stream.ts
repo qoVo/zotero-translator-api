@@ -125,19 +125,30 @@ function createChunkEncoder(model: string) {
 }
 
 /**
+ * 上游中途出错时追加到译文末尾的提示，让用户知道译文不完整。
+ */
+export const STREAM_INTERRUPTED_NOTICE = "\n\n[翻译中断，请重试]";
+
+/**
  * 把 Workers AI 的流式输出转换成 OpenAI chat.completion.chunk 格式。
  *
  * 不同模型的分片格式不完全一致，这里同时兼容
  * {"response": "..."} 和 {"choices": [{"delta": {"content": "..."}}]}。
  *
- * 流正常结束后调用 onComplete，传入完整译文和结束原因，用于写入缓存。
- * 客户端中途断开时不会调用。
+ * 流结束后调用 onComplete，传入完整译文和结束原因，用于写入缓存：
+ * - 上游给出 finish_reason 时直接使用；
+ * - 只收到 [DONE] 时视为正常结束（"stop"）；
+ * - 两者都没有就关闭了连接，说明输出可能被截断，传入 "incomplete"。
+ *
+ * 上游读取出错时，先补发中断提示和结束分片，让插件能正常收尾，
+ * 不调用 onComplete，避免缓存不完整的译文。客户端中途断开时也不会调用。
  */
 export function toOpenAIStream(
 	upstream: ReadableStream<Uint8Array>,
 	model: string,
 	onComplete?: (text: string, finishReason: string) => void,
 ): ReadableStream<Uint8Array> {
+	const reader = upstream.getReader();
 	const decoder = new TextDecoder();
 	const chunks = createChunkEncoder(model);
 	const thinkFilter = createThinkFilter();
@@ -145,22 +156,21 @@ export function toOpenAIStream(
 	let lineBuffer = "";
 	let output = "";
 	let finishReason: string | null = null;
+	let sawDone = false;
 	let usage: unknown;
+	let emitted = 0;
 
-	const emit = (
-		content: string,
-		controller: TransformStreamDefaultController<Uint8Array>,
-	) => {
+	type Controller = ReadableStreamDefaultController<Uint8Array>;
+
+	const emit = (content: string, controller: Controller) => {
 		if (content) {
 			output += content;
+			emitted++;
 			controller.enqueue(chunks.chunk({ content }));
 		}
 	};
 
-	const handleLine = (
-		line: string,
-		controller: TransformStreamDefaultController<Uint8Array>,
-	) => {
+	const handleLine = (line: string, controller: Controller) => {
 		const trimmed = line.trim();
 
 		if (!trimmed.startsWith("data:")) {
@@ -169,7 +179,12 @@ export function toOpenAIStream(
 
 		const data = trimmed.slice(5).trim();
 
-		if (!data || data === "[DONE]") {
+		if (data === "[DONE]") {
+			sawDone = true;
+			return;
+		}
+
+		if (!data) {
 			return;
 		}
 
@@ -191,14 +206,60 @@ export function toOpenAIStream(
 		);
 	};
 
-	return upstream.pipeThrough(
-		new TransformStream<Uint8Array, Uint8Array>({
-			start(controller) {
-				controller.enqueue(chunks.chunk({ role: "assistant", content: "" }));
-			},
+	/**
+	 * 发送结束分片和 [DONE]。插件只认 finish_reason 是否为空，
+	 * 所以发给插件的结束原因保持兼容，真实原因单独返回给调用方。
+	 */
+	const finish = (controller: Controller, clientReason: string) => {
+		controller.enqueue(chunks.chunk({}, clientReason, usage));
+		controller.enqueue(chunks.done());
+		controller.close();
+	};
 
-			transform(data, controller) {
-				lineBuffer += decoder.decode(data, { stream: true });
+	return new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(chunks.chunk({ role: "assistant", content: "" }));
+		},
+
+		/*
+		 * 有的上游分片不产生任何输出（例如推理块、只有 finish_reason
+		 * 的分片或 [DONE]）。workerd 在 pull 没有入队内容时不会再次调用
+		 * pull，所以这里一直读到有输出或流结束为止。
+		 */
+		async pull(controller) {
+			const emittedBefore = emitted;
+
+			while (emitted === emittedBefore) {
+				let result: ReadableStreamReadResult<Uint8Array>;
+
+				try {
+					result = await reader.read();
+				} catch (error) {
+					console.error(`Workers AI 流式输出中断：${model}`, error);
+
+					// 未读完的半行 JSON 直接丢弃，已缓存的正文照常发出。
+					emit(thinkFilter.flush(), controller);
+					controller.enqueue(
+						chunks.chunk({ content: STREAM_INTERRUPTED_NOTICE }),
+					);
+					finish(controller, "error");
+					return;
+				}
+
+				if (result.done) {
+					lineBuffer += decoder.decode();
+					handleLine(lineBuffer, controller);
+					emit(thinkFilter.flush(), controller);
+
+					const completedReason =
+						finishReason ?? (sawDone ? "stop" : "incomplete");
+
+					onComplete?.(output.trim(), completedReason);
+					finish(controller, finishReason ?? "stop");
+					return;
+				}
+
+				lineBuffer += decoder.decode(result.value, { stream: true });
 
 				const lines = lineBuffer.split("\n");
 				lineBuffer = lines.pop() ?? "";
@@ -206,20 +267,13 @@ export function toOpenAIStream(
 				for (const line of lines) {
 					handleLine(line, controller);
 				}
-			},
+			}
+		},
 
-			flush(controller) {
-				lineBuffer += decoder.decode();
-				handleLine(lineBuffer, controller);
-				emit(thinkFilter.flush(), controller);
-
-				const reason = finishReason ?? "stop";
-				controller.enqueue(chunks.chunk({}, reason, usage));
-				controller.enqueue(chunks.done());
-				onComplete?.(output.trim(), reason);
-			},
-		}),
-	);
+		cancel(reason) {
+			return reader.cancel(reason);
+		},
+	});
 }
 
 /**
