@@ -104,4 +104,4 @@ npx tsc --noEmit  # 类型检查
 
 ## 许可证
 
-[MIT](LICENSE)
+[MIT License](LICENSE)
